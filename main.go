@@ -6,9 +6,25 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/mmcdole/gofeed"
 )
+
+// filterNewJobs returns only those items published after the given threshold.
+func filterNewJobs(items []*gofeed.Item, threshold time.Time) []*gofeed.Item {
+	var newJobs []*gofeed.Item
+	for _, item := range items {
+
+		//debug only
+		// fmt.Println("DEBUG ONLY!!", item.Title)
+		// Check if PublishedParsed is available and after threshold.
+		if item.PublishedParsed != nil && item.PublishedParsed.After(threshold) {
+			newJobs = append(newJobs, item)
+		}
+	}
+	return newJobs
+}
 
 func fetchFeed(url string, ch chan<- []*gofeed.Item, wg *sync.WaitGroup) {
 	defer wg.Done()
@@ -63,11 +79,19 @@ func main() {
 		allItems = append(allItems, items...)
 	}
 
-	for _, item := range allItems {
-		fmt.Println()
-		fmt.Println("🔹", item.Title)
-		fmt.Println("📎", item.Link)
-		fmt.Println("🕒", item.Published)
-		fmt.Println()
+	newThreshold := time.Now().Add(-1 * time.Hour)
+
+	newJobs := filterNewJobs(allItems, newThreshold)
+	if len(newJobs) == 0 {
+		log.Println("No new vacancies found.")
+		return
 	}
+
+	// for _, item := range allItems {
+	// 	fmt.Println()
+	// 	fmt.Println("🔹", item.Title)
+	// 	fmt.Println("📎", item.Link)
+	// 	fmt.Println("🕒", item.Published)
+	// 	fmt.Println()
+	// }
 }
