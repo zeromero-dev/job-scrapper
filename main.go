@@ -14,31 +14,31 @@ import (
 	"github.com/segmentio/kafka-go"
 )
 
-var kafkaWriter *kafka.Writer
+var (
+	kafkaWriter *kafka.Writer
+	feeds       = []string{
+		"https://jobs.dou.ua/vacancies/feeds/?category=Golang&exp=0-1",
+		"https://jobs.dou.ua/vacancies/feeds/?exp=1-3&category=Golang",
+	}
+)
 
-// initKafka creates a Kafka writer to send messages to our topic.
 func initKafka() {
 	kafkaWriter = kafka.NewWriter(kafka.WriterConfig{
-		Brokers:  []string{"localhost:9092"}, // adjust if needed
+		Brokers:  []string{"localhost:9092"},
 		Topic:    "job_notifications",
 		Balancer: &kafka.LeastBytes{},
 	})
 }
 
-// closeKafka closes the Kafka writer connection.
 func closeKafka() {
 	if kafkaWriter != nil {
 		kafkaWriter.Close()
 	}
 }
 
-// filterNewJobs returns only those items published after the given threshold.
 func filterNewJobs(items []*gofeed.Item, threshold time.Time) []*gofeed.Item {
 	var newJobs []*gofeed.Item
 	for _, item := range items {
-		// Debug info
-		fmt.Println("DEBUG:", item.Title, item.Link)
-		// Use PublishedParsed to check timestamp.
 		if item.PublishedParsed != nil && item.PublishedParsed.After(threshold) {
 			newJobs = append(newJobs, item)
 		}
@@ -46,7 +46,6 @@ func filterNewJobs(items []*gofeed.Item, threshold time.Time) []*gofeed.Item {
 	return newJobs
 }
 
-// fetchFeed retrieves and parses the feed from the given URL.
 func fetchFeed(url string, ch chan<- []*gofeed.Item, wg *sync.WaitGroup) {
 	defer wg.Done()
 
@@ -70,21 +69,12 @@ func fetchFeed(url string, ch chan<- []*gofeed.Item, wg *sync.WaitGroup) {
 		return
 	}
 
-	if len(feed.Items) == 0 {
-		fmt.Printf("❌ No vacancies in %s\n", url)
-		return
+	if len(feed.Items) > 0 {
+		ch <- feed.Items
 	}
-
-	ch <- feed.Items
 }
 
-// checkFeeds fetches the feeds, filters new vacancies, and sends the formatted message to Kafka.
-func checkFeeds() {
-	feeds := []string{
-		"https://jobs.dou.ua/vacancies/feeds/?category=Golang&exp=0-1",
-		"https://jobs.dou.ua/vacancies/feeds/?exp=1-3&category=Golang",
-	}
-
+func collectFeeds() []*gofeed.Item {
 	var wg sync.WaitGroup
 	itemChan := make(chan []*gofeed.Item, len(feeds))
 
@@ -100,59 +90,64 @@ func checkFeeds() {
 	for items := range itemChan {
 		allItems = append(allItems, items...)
 	}
+	return allItems
+}
 
-	// Define new vacancy threshold: items published within the last hour.
-	newThreshold := time.Now().Add(-1 * time.Hour)
-	newJobs := filterNewJobs(allItems, newThreshold)
+func formatJobs(items []*gofeed.Item) string {
+	var lines []string
+	for _, item := range items {
+		lines = append(lines, fmt.Sprintf("🔹 %s\n📎 %s\n🕒 %s", item.Title, item.Link, item.Published))
+	}
+	return strings.Join(lines, "\n\n")
+}
+
+func handleNewJobs(w http.ResponseWriter, r *http.Request) {
+	allItems := collectFeeds()
+	newJobs := filterNewJobs(allItems, time.Now().Add(-1*time.Hour))
+
 	if len(newJobs) == 0 {
-		log.Println("No new vacancies found.")
+		http.Error(w, "No new vacancies found.", http.StatusNotFound)
 		return
 	}
 
-	// Build a message for the new vacancy(ies).
-	var newJobsDetails []string
-	for _, item := range newJobs {
-		newJobsDetails = append(newJobsDetails, fmt.Sprintf("🔹 %s\n📎 %s\n🕒 %s", item.Title, item.Link, item.Published))
-	}
-	newJobsMsg := strings.Join(newJobsDetails, "\n\n")
+	msg := formatJobs(newJobs)
 
-	// Build a message for all available vacancies.
-	var allJobsDetails []string
-	for _, item := range allItems {
-		allJobsDetails = append(allJobsDetails, fmt.Sprintf("🔹 %s\n📎 %s\n🕒 %s", item.Title, item.Link, item.Published))
-	}
-	allJobsMsg := strings.Join(allJobsDetails, "\n\n")
-
-	// Construct the final Kafka message.
-	finalMsg := fmt.Sprintf("New vacancy just dropped!\n\n%s\n\nAlso if you missed previous:\n\n%s", newJobsMsg, allJobsMsg)
-
-	// Send the message to Kafka.
-	log.Println("Sending message to Kafka...")
+	// Send to Kafka
 	err := kafkaWriter.WriteMessages(context.Background(),
 		kafka.Message{
 			Key:   []byte("job_notification"),
-			Value: []byte(finalMsg),
+			Value: []byte(msg),
 		},
 	)
 	if err != nil {
-		log.Printf("Failed to send Kafka message: %v", err)
-	} else {
-		log.Println("Kafka message sent successfully.")
+		log.Printf("Kafka error: %v", err)
 	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Write([]byte(msg))
+}
+
+func handleAllJobs(w http.ResponseWriter, r *http.Request) {
+	allItems := collectFeeds()
+	if len(allItems) == 0 {
+		http.Error(w, "No vacancies found.", http.StatusNotFound)
+		return
+	}
+
+	msg := formatJobs(allItems)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Write([]byte(msg))
 }
 
 func main() {
 	initKafka()
 	defer closeKafka()
 
-	// Immediately check feeds once.
-	checkFeeds()
+	http.HandleFunc("/new", handleNewJobs)
+	http.HandleFunc("/all", handleAllJobs)
 
-	// Set up a ticker to check feeds every hour.
-	ticker := time.NewTicker(1 * time.Hour)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		checkFeeds()
+	log.Println("Server started at :8080")
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		log.Fatalf("Server failed: %v", err)
 	}
 }
