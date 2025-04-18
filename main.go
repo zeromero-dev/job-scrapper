@@ -1,39 +1,25 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/go-gomail/gomail"
+	"github.com/joho/godotenv"
 	"github.com/mmcdole/gofeed"
-	"github.com/segmentio/kafka-go"
 )
 
-var (
-	kafkaWriter *kafka.Writer
-	feeds       = []string{
-		"https://jobs.dou.ua/vacancies/feeds/?category=Golang&exp=0-1",
-		"https://jobs.dou.ua/vacancies/feeds/?exp=1-3&category=Golang",
-	}
-)
-
-func initKafka() {
-	kafkaWriter = kafka.NewWriter(kafka.WriterConfig{
-		Brokers:  []string{"localhost:9092"},
-		Topic:    "job_notifications",
-		Balancer: &kafka.LeastBytes{},
-	})
-}
-
-func closeKafka() {
-	if kafkaWriter != nil {
-		kafkaWriter.Close()
-	}
+var lastCheckedTime time.Time = time.Now().Add(-1 * time.Hour)
+var mu sync.Mutex
+var feeds = []string{
+	"https://jobs.dou.ua/vacancies/feeds/?category=Golang&exp=0-1",
+	"https://jobs.dou.ua/vacancies/feeds/?exp=1-3&category=Golang",
 }
 
 func filterNewJobs(items []*gofeed.Item, threshold time.Time) []*gofeed.Item {
@@ -102,8 +88,13 @@ func formatJobs(items []*gofeed.Item) string {
 }
 
 func handleNewJobs(w http.ResponseWriter, r *http.Request) {
+	mu.Lock()
+	threshold := lastCheckedTime
+	lastCheckedTime = time.Now()
+	mu.Unlock()
+
 	allItems := collectFeeds()
-	newJobs := filterNewJobs(allItems, time.Now().Add(-1*time.Hour))
+	newJobs := filterNewJobs(allItems, threshold)
 
 	if len(newJobs) == 0 {
 		http.Error(w, "No new vacancies found.", http.StatusNotFound)
@@ -112,15 +103,10 @@ func handleNewJobs(w http.ResponseWriter, r *http.Request) {
 
 	msg := formatJobs(newJobs)
 
-	// Send to Kafka
-	err := kafkaWriter.WriteMessages(context.Background(),
-		kafka.Message{
-			Key:   []byte("job_notification"),
-			Value: []byte(msg),
-		},
-	)
-	if err != nil {
-		log.Printf("Kafka error: %v", err)
+	// Send an email
+	subject := fmt.Sprintf("New Job Postings (%d)", len(newJobs))
+	if err := sendEmailNotification(subject, msg); err != nil {
+		log.Printf("Email error: %v", err)
 	}
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -139,10 +125,33 @@ func handleAllJobs(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(msg))
 }
 
-func main() {
-	initKafka()
-	defer closeKafka()
+var sendEmailNotification = func(subject, body string) error {
+	// Load environment variables
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatalf("Error loading .env file")
+	}
 
+	from := os.Getenv("EMAIL_ADDRESS")
+	password := os.Getenv("EMAIL_PASSWORD")
+	to := os.Getenv("RECIPIENT_EMAIL")
+	smtpHost := os.Getenv("SMTP_HOST")
+	// smtpPort := os.Getenv("SMTP_PORT")
+
+	// Create a new gomail message
+	mailer := gomail.NewMessage()
+	mailer.SetHeader("From", from)
+	mailer.SetHeader("To", to)
+	mailer.SetHeader("Subject", subject)
+	mailer.SetBody("text/plain", body)
+
+	dialer := gomail.NewDialer(smtpHost, 465, from, password)
+
+	// Send the email
+	return dialer.DialAndSend(mailer)
+}
+
+func main() {
 	http.HandleFunc("/new", handleNewJobs)
 	http.HandleFunc("/all", handleAllJobs)
 
